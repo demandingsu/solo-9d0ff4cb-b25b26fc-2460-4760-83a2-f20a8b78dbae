@@ -3,72 +3,9 @@
 """
 from __future__ import annotations
 
-import functools
-import http.server
-import importlib.util
-import sys
-import threading
-from datetime import datetime
-from pathlib import Path
+import random
 
 import pytest
-from fastapi.testclient import TestClient
-
-ROOT = Path(__file__).resolve().parent.parent
-DEMO_DIR = ROOT / "demo_site"
-
-# 加载示例数据生成器（脚本名带连字符，用 importlib）
-spec = importlib.util.spec_from_file_location(
-    "generate_demo_site", ROOT / "scripts" / "generate_demo_site.py"
-)
-gen = importlib.util.module_from_spec(spec)
-sys.modules["generate_demo_site"] = gen
-spec.loader.exec_module(gen)
-
-
-# ---------------------------------------------------------------------------
-# 静态文件服务器（支持可选的故障注入）
-# ---------------------------------------------------------------------------
-class FlakyHandler(http.server.SimpleHTTPRequestHandler):
-    # 类属性：需要返回 404 的路径集合
-    fail_paths: set[str] = set()
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, directory=str(DEMO_DIR), **kwargs)
-
-    def do_GET(self):  # noqa: N802
-        if self.path in self.fail_paths:
-            self.send_error(404, "injected failure")
-            return
-        return super().do_GET()
-
-    def log_message(self, *args):  # 静默
-        pass
-
-
-@pytest.fixture(scope="session")
-def demo_server():
-    handler = functools.partial(FlakyHandler)
-    httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
-    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
-    thread.start()
-    host, port = httpd.server_address
-    yield f"http://{host}:{port}", httpd, FlakyHandler
-    httpd.shutdown()
-
-
-@pytest.fixture()
-def client(tmp_path, monkeypatch):
-    # 每个测试使用独立临时数据库
-    monkeypatch.setenv("TENDER_DB_PATH", str(tmp_path / "test.db"))
-    from app import config, database
-    importlib.reload(config)
-    import app.main as main
-    importlib.reload(database)
-    importlib.reload(main)
-    database.init_db()
-    with TestClient(main.app) as c:
-        yield c, main, database
 
 
 # ---------------------------------------------------------------------------
@@ -87,14 +24,15 @@ def project_map(payload):
 # ---------------------------------------------------------------------------
 # 测试用例
 # ---------------------------------------------------------------------------
-def test_full_collection_and_deadline_resolution(client, demo_server):
+def test_full_collection_and_deadline_resolution(client, demo_server, gen_module):
     c, main, _ = client
     base, _, _ = demo_server
     payload = collect(c, base)
     assert payload["collected"] == 10
+    assert payload["paragraphs_indexed"] == 15
 
     projects = project_map(payload)
-    assert set(projects) == {a.project_name for a in gen.ANNOUNCEMENTS}
+    assert set(projects) == {a.project_name for a in gen_module.ANNOUNCEMENTS}
 
     # A：更正延期生效
     a = projects["滨河路市政改造工程"]
@@ -125,7 +63,7 @@ def test_full_collection_and_deadline_resolution(client, demo_server):
     assert e["deadline_source_code"] == "SZ-2026-005-G1"
 
 
-def test_order_independence():
+def test_order_independence(gen_module):
     """打乱输入顺序，归并结果必须一致。"""
     from app.merge import merge_projects
 
@@ -140,14 +78,37 @@ def test_order_independence():
             "corrects_code": a.corrects_code,
             "detail_url": f"http://x/{a.code}.html",
         }
-        for a in gen.ANNOUNCEMENTS
+        for a in gen_module.ANNOUNCEMENTS
     ]
     baseline = merge_projects(rows)
     shuffled = list(reversed(rows))
-    import random
-
     random.Random(42).shuffle(shuffled)
     assert merge_projects(shuffled) == baseline
+
+
+def test_same_code_in_different_catalogs_merges_independently():
+    """同一公告编号出现在不同入口目录时，各目录独立归并、互不影响。"""
+    from app.merge import merge_projects
+
+    def rows_for(catalog, deadline):
+        return [
+            {
+                "catalog_url": catalog,
+                "code": "X-1", "title": "t", "kind": "original",
+                "project_name": "P", "published_at": "2026-11-01 10:00",
+                "deadline": deadline, "corrects_code": None,
+                "detail_url": f"{catalog}/X-1.html",
+            }
+        ]
+
+    rows = rows_for("http://a/list_1.html", "2026-12-01 10:00") + rows_for(
+        "http://b/list_1.html", "2026-12-05 10:00"
+    )
+    results = merge_projects(rows)
+    assert len(results) == 2
+    by_catalog = {r.catalog_url: r for r in results}
+    assert by_catalog["http://a/list_1.html"].deadline == "2026-12-01 10:00"
+    assert by_catalog["http://b/list_1.html"].deadline == "2026-12-05 10:00"
 
 
 def test_duplicate_collection_creates_no_duplicates(client, demo_server):
@@ -161,9 +122,13 @@ def test_duplicate_collection_creates_no_duplicates(client, demo_server):
         distinct = conn.execute(
             "SELECT COUNT(DISTINCT code) FROM announcements"
         ).fetchone()[0]
+        paragraphs = conn.execute("SELECT COUNT(*) FROM paragraphs").fetchone()[0]
+        indexed = conn.execute("SELECT COUNT(*) FROM paragraph_fts").fetchone()[0]
         runs = conn.execute("SELECT COUNT(*) FROM collection_runs").fetchone()[0]
     assert total == 10
     assert distinct == 10
+    assert paragraphs == 15
+    assert indexed == 15
     assert runs == 2
 
     # 查询接口仍然是 5 个项目
@@ -252,7 +217,7 @@ def test_expired_flag_uses_fixed_now(client, demo_server):
     base, _, _ = demo_server
     collect(c, base)
 
-    fixed_now = datetime(2026, 11, 26, 0, 0)
+    fixed_now = __import__("datetime").datetime(2026, 11, 26, 0, 0)
     projects = {p["project_name"]: p for p in service.query_projects(fixed_now)}
     # A 的截止 11-25 已过期；B 的 11-30 未过期
     assert projects["滨河路市政改造工程"]["is_expired"] is True

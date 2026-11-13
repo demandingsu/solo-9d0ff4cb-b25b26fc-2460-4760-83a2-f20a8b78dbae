@@ -3,10 +3,11 @@
 流程：
 1. 从用户提交的列表页开始，沿分页链接抓取全部列表页（去重、防环、限量）；
 2. 收集列表页中全部详情页链接（同源、去重）；
-3. 逐页抓取详情并解析为结构化公告。
+3. 逐页抓取详情并解析为结构化公告，同时抽取"正文条款"段落原文
+   （section.body-clauses 内的 p.clause，按文档顺序）。
 
-任一列表页或详情页读取失败（网络错误、非 2xx、HTML 缺关键字段）都抛出
-CollectionError，由上层整体放弃本次采集，数据库保留上次成功结果。
+任一列表页或详情页读取失败（网络错误、非 2xx、HTML 缺关键字段或正文条款
+缺失）都抛出 CollectionError，由上层整体放弃本次采集，数据库保留上次成功结果。
 """
 from __future__ import annotations
 
@@ -34,6 +35,7 @@ class ParsedAnnouncement:
     deadline: str | None
     corrects_code: str | None
     detail_url: str
+    paragraphs: list[str]
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -45,6 +47,7 @@ class ParsedAnnouncement:
             "deadline": self.deadline,
             "corrects_code": self.corrects_code,
             "detail_url": self.detail_url,
+            "paragraphs": list(self.paragraphs),
         }
 
 
@@ -91,6 +94,21 @@ def _field(soup: BeautifulSoup, label: str) -> str | None:
     return text or None
 
 
+def _parse_paragraphs(article: BeautifulSoup, detail_url: str) -> list[str]:
+    """抽取详情页"正文条款"段落：section.body-clauses 内的每个 p.clause 为一段。"""
+    section = article.select_one("section.body-clauses")
+    if section is None:
+        raise CollectionError(f"详情页 {detail_url} 缺少 section.body-clauses 正文条款容器")
+    paragraphs = [
+        text
+        for p in section.select("p.clause")
+        if (text := p.get_text(strip=True))
+    ]
+    if not paragraphs:
+        raise CollectionError(f"详情页 {detail_url} 未解析到任何正文条款段落")
+    return paragraphs
+
+
 def _parse_detail(html_text: str, detail_url: str) -> ParsedAnnouncement:
     soup = BeautifulSoup(html_text, "html.parser")
     article = soup.select_one("article.announcement-detail")
@@ -127,6 +145,8 @@ def _parse_detail(html_text: str, detail_url: str) -> ParsedAnnouncement:
     if kind == "correction" and not corrects:
         raise CollectionError(f"更正公告 {code}（{detail_url}）缺少原公告编号")
 
+    paragraphs = _parse_paragraphs(article, detail_url)
+
     return ParsedAnnouncement(
         code=code.strip(),
         title=title.strip(),
@@ -136,6 +156,7 @@ def _parse_detail(html_text: str, detail_url: str) -> ParsedAnnouncement:
         deadline=deadline.strip() if deadline else None,
         corrects_code=corrects.strip() if corrects else None,
         detail_url=detail_url,
+        paragraphs=paragraphs,
     )
 
 

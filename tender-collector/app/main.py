@@ -5,8 +5,14 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Query
 
 from . import database
-from .models import CollectRequest, CollectResponse, ProjectOut, RunOut
-from .service import ServiceError, query_projects, run_collection
+from .models import (
+    CollectRequest,
+    CollectResponse,
+    ProjectOut,
+    RunOut,
+    SearchResponse,
+)
+from .service import ServiceError, query_projects, run_collection, search_clauses
 
 
 @asynccontextmanager
@@ -16,13 +22,15 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title="市政工程投标截止时间采集 API",
+    title="市政工程公告采集与条款检索 API",
     description=(
-        "提交公告列表页地址，服务抓取全部详情页，将更正公告按引用的原公告编号归并，"
-        "按发布时间确定生效的投标截止时间。重复采集不产生重复记录；"
-        "任一详情页读取失败时整体报错并保留上次成功采集结果。"
+        "提交公告列表页地址，服务抓取全部详情页：将更正公告按引用的原公告编号归并，"
+        "按发布时间确定生效的投标截止时间；同时抽取详情页“正文条款”段落，"
+        "按入口目录建立可检索索引（中文两字词与连续短语按原文命中）。"
+        "复采某目录成功后，该目录的正文检索与截止时间查询同时切换；"
+        "任一页面读取、归并或索引写入失败时整体报错，两种查询都保留上次成功结果。"
     ),
-    version="1.0.0",
+    version="1.1.0",
     lifespan=lifespan,
 )
 
@@ -45,6 +53,16 @@ def collect_endpoint(req: CollectRequest) -> CollectResponse:
 @app.get("/api/projects", response_model=list[ProjectOut])
 def list_projects() -> list[ProjectOut]:
     return [ProjectOut(**p) for p in query_projects()]
+
+
+@app.get("/api/search", response_model=SearchResponse)
+def search(
+    q: str = Query(..., min_length=1, description="检索词：中文两字词或连续短语"),
+    catalog_url: str | None = Query(
+        None, description="可选：只检索该入口目录（提交采集时的列表页地址）"
+    ),
+) -> SearchResponse:
+    return SearchResponse(**search_clauses(q, catalog_url))
 
 
 @app.get("/api/collections", response_model=list[RunOut])
